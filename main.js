@@ -1,6 +1,21 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
 
+// -------------------- New Math Functions --------------------
+
+// Standard Normal PDF
+function stdNormalPDF(x) {
+  return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
+}
+
+// Black-Scholes Gamma calculation
+function computeGamma(S, K, r, sigma, T) {
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
+  return stdNormalPDF(d1) / (S * sigma * Math.sqrt(T));
+}
+
+// -------------------- End New Math Functions --------------------
+
 // State variables
 const state = {
   currentSymbol: "AAPL",
@@ -11,7 +26,12 @@ const state = {
   surfaceType: "surface", // wireframe, points, or surface
   colorScheme: "rainbow", // rainbow, heatmap, monochrome
   gammaDisplayMode: "plane", // plane, points, lines
-  showOptionsChain: true // Show options chain table
+  showOptionsChain: true, // Show options chain table
+  normalizeStrikes: false, // New toggle: normalize strike prices around ATM (100%)
+  riskFreeRate: 0.035, // Risk-free rate for Black-Scholes
+  contractMultiplier: 100, // For gamma exposure scaling
+  desiredVolHeight: 100, // Desired max height for normalized IV in the surface
+  atmPrice: 0 // Will be set when synthetic data is generated
 };
 
 // Scene setup
@@ -72,6 +92,15 @@ let gridGroup = new THREE.Group();
 scene.add(axisLines);
 scene.add(labelGroup);
 scene.add(gridGroup);
+
+// Helper function to transform strike values if normalization is enabled.
+// When enabled, strike values are expressed relative to the ATM price (scaled to 100).
+function transformStrike(strike) {
+  if (state.normalizeStrikes && state.atmPrice) {
+    return (strike / state.atmPrice) * 100;
+  }
+  return strike;
+}
 
 // Create initial grid with Bloomberg-like look
 function createGrid() {
@@ -272,6 +301,24 @@ function createDashboard() {
   chainDiv.appendChild(chainLabel);
   
   togglesDiv.appendChild(chainDiv);
+
+  // NEW: Normalize Strikes toggle
+  const normDiv = document.createElement('div');
+  normDiv.style.marginBottom = '5px';
+  
+  const normCheckbox = document.createElement('input');
+  normCheckbox.type = 'checkbox';
+  normCheckbox.id = 'normalizeStrikesToggle';
+  normCheckbox.checked = state.normalizeStrikes;
+  normCheckbox.style.marginRight = '5px';
+  normDiv.appendChild(normCheckbox);
+  
+  const normLabel = document.createElement('label');
+  normLabel.textContent = 'Normalize Strikes';
+  normLabel.htmlFor = 'normalizeStrikesToggle';
+  normDiv.appendChild(normLabel);
+  
+  togglesDiv.appendChild(normDiv);
   
   controlsContainer.appendChild(togglesDiv);
   
@@ -390,6 +437,7 @@ function createDashboard() {
     state.showGamma = gammaCheckbox.checked;
     state.showLabels = labelsCheckbox.checked;
     state.showOptionsChain = chainCheckbox.checked;
+    state.normalizeStrikes = normCheckbox.checked;
     state.surfaceType = surfaceTypeSelect.value;
     state.colorScheme = colorSelect.value;
     state.gammaDisplayMode = gammaTypeSelect.value;
@@ -496,7 +544,7 @@ function createAxisLabels() {
   
   // X-Axis Label (Strike)
   const xAxisLabel = document.createElement('div');
-  xAxisLabel.textContent = 'Strike';
+  xAxisLabel.textContent = state.normalizeStrikes ? 'Normalized Strike (%)' : 'Strike';
   xAxisLabel.style.position = 'absolute';
   xAxisLabel.style.bottom = '10px';
   xAxisLabel.style.left = '50%';
@@ -875,7 +923,8 @@ async function fetchOptionsData() {
   }
 }
 
-// Generate synthetic IV and Greek data
+// -------------------- Updated Synthetic Data Generation --------------------
+// Generate synthetic IV and Greek data using refined gamma math
 function generateSyntheticData(contracts, baseIV = 0.3) {
   const syntheticData = [];
   
@@ -899,6 +948,9 @@ function generateSyntheticData(contracts, baseIV = 0.3) {
     stockPrice = 100;
   }
   
+  // Store ATM price for normalization
+  state.atmPrice = stockPrice;
+  
   console.log(`Estimated current stock price: ${stockPrice}`);
   
   // Group by expiration date for better term structure
@@ -915,7 +967,7 @@ function generateSyntheticData(contracts, baseIV = 0.3) {
     expirationGroups[expDate].push(contract);
   });
   
-  // Generate a consistent IV surface with reasonable term structure
+  // Generate a consistent IV surface with realistic term structure
   Object.entries(expirationGroups).forEach(([expDate, contracts]) => {
     const expiryDate = new Date(expDate);
     const daysToExpiry = (expiryDate - new Date()) / (1000 * 60 * 60 * 24);
@@ -949,11 +1001,16 @@ function generateSyntheticData(contracts, baseIV = 0.3) {
       // Add randomness to make it look more realistic
       iv += (Math.random() * 0.02 - 0.01);
       
-      // Calculate realistic greeks
-      // Gamma is highest ATM and decreases away from the strike
-      const gamma = 0.04 * Math.exp(-25 * Math.pow(moneyness, 2)) / termFactor;
+      // Compute time to expiry in years
+      const timeToExpiry = daysToExpiry / 365;
       
-      // Delta ranges from 0 to 1 for calls, -1 to 0 for puts
+      // Compute Black-Scholes gamma using our refined math
+      const gamma_bs = computeGamma(stockPrice, strike, state.riskFreeRate, iv, timeToExpiry);
+      // Compute gamma exposure: gamma * open interest * contract multiplier
+      const openInterest = Math.floor(Math.random() * 1000) + 50;
+      const gammaExposure = gamma_bs * openInterest * state.contractMultiplier;
+      
+      // Calculate realistic option greeks (delta, theta, vega) remain similar for demonstration
       let delta;
       if (contract.contract_type === 'call') {
         delta = 0.5 + 0.5 * (1 - Math.exp(-10 * moneyness));
@@ -961,18 +1018,11 @@ function generateSyntheticData(contracts, baseIV = 0.3) {
         delta = -0.5 - 0.5 * (1 - Math.exp(-10 * -moneyness));
       }
       
-      // Theta is negative for options, more negative near expiry
-      const theta = -stockPrice * 0.01 * gamma / termFactor;
-      
-      // Vega increases with time to expiry
-      const vega = stockPrice * 0.01 * gamma * termFactor;
-      
-      // Calculate realistic option price
-      const rate = 0.035; // Risk-free rate
-      const timeToExpiry = daysToExpiry / 365;
+      const theta = -stockPrice * 0.01 * gamma_bs / termFactor;
+      const vega = stockPrice * 0.01 * gamma_bs * termFactor;
       
       // Black-Scholes approximation for option price
-      let optionPrice;
+      const rate = state.riskFreeRate;
       const d1 = (Math.log(stockPrice / strike) + (rate + 0.5 * iv * iv) * timeToExpiry) / (iv * Math.sqrt(timeToExpiry));
       const d2 = d1 - iv * Math.sqrt(timeToExpiry);
       
@@ -983,27 +1033,24 @@ function generateSyntheticData(contracts, baseIV = 0.3) {
         return x >= 0 ? 1 - p : p;
       };
       
+      let optionPrice;
       if (contract.contract_type === 'call') {
         optionPrice = stockPrice * normCDF(d1) - strike * Math.exp(-rate * timeToExpiry) * normCDF(d2);
       } else {
         optionPrice = strike * Math.exp(-rate * timeToExpiry) * normCDF(-d2) - stockPrice * normCDF(-d1);
       }
       
-      // Add some randomness to prices
       const bidPrice = optionPrice * (0.95 + Math.random() * 0.03);
       const askPrice = optionPrice * (1.02 + Math.random() * 0.03);
       const lastPrice = optionPrice * (0.97 + Math.random() * 0.06);
-      
-      // Open interest and volume - random but realistic
-      const openInterest = Math.floor(Math.random() * 1000) + 50;
-      const volume = Math.floor(Math.random() * openInterest * 0.8);
       
       syntheticData.push({
         ticker: contract.ticker,
         strike: strike,
         daysToExpiry: daysToExpiry,
         iv: iv,
-        gamma: gamma,
+        // Use gamma exposure as the gamma metric for visualization and table
+        gamma: gammaExposure,
         delta: delta,
         theta: theta,
         vega: vega,
@@ -1013,7 +1060,7 @@ function generateSyntheticData(contracts, baseIV = 0.3) {
         ask_price: askPrice,
         last_price: lastPrice,
         open_interest: openInterest,
-        volume: volume,
+        volume: Math.floor(Math.random() * openInterest * 0.8),
         expiration_date: contract.expiration_date
       });
     });
@@ -1037,6 +1084,8 @@ function findClosestIndex(arr, val) {
   
   return closestIndex;
 }
+
+// -------------------- End Updated Synthetic Data Generation --------------------
 
 // Clear previous visualization
 function clearScene() {
@@ -1214,10 +1263,13 @@ function createOptionsChainTable(data) {
       const expDate = new Date();
       expDate.setDate(expDate.getDate() + contract.daysToExpiry);
       
+      // If strikes are normalized, convert strike value
+      const strikeVal = state.normalizeStrikes ? transformStrike(contract.strike) : contract.strike;
+      
       const cells = [
         expDate.toLocaleDateString(),
         contract.contract_type.toUpperCase(),
-        contract.strike.toFixed(2),
+        strikeVal.toFixed(2),
         '$' + (contract.last_price || (contract.strike * 0.05)).toFixed(2),
         '$' + (contract.bid_price || (contract.strike * 0.045)).toFixed(2),
         '$' + (contract.ask_price || (contract.strike * 0.055)).toFixed(2),
@@ -1392,7 +1444,7 @@ function createVolatilitySurface(data) {
     return;
   }
   
-  // Extract data ranges
+  // Extract data ranges using transformed strikes if normalization is enabled
   let minStrike = Infinity;
   let maxStrike = -Infinity;
   let minDays = Infinity;
@@ -1407,8 +1459,10 @@ function createVolatilitySurface(data) {
   const strikePrices = new Set();
   
   data.forEach(item => {
-    minStrike = Math.min(minStrike, item.strike);
-    maxStrike = Math.max(maxStrike, item.strike);
+    // Transform strike if needed
+    const strikeVal = transformStrike(item.strike);
+    minStrike = Math.min(minStrike, strikeVal);
+    maxStrike = Math.max(maxStrike, strikeVal);
     minDays = Math.min(minDays, item.daysToExpiry);
     maxDays = Math.max(maxDays, item.daysToExpiry);
     minIV = Math.min(minIV, item.iv);
@@ -1418,8 +1472,8 @@ function createVolatilitySurface(data) {
       maxGamma = Math.max(maxGamma, item.gamma);
     }
     
-    // Track unique strike prices
-    strikePrices.add(item.strike);
+    // Track unique strike prices (transformed)
+    strikePrices.add(strikeVal);
     
     // Group by expiration
     const daysKey = Math.round(item.daysToExpiry);
@@ -1512,7 +1566,7 @@ function createVolatilitySurface(data) {
   
   // Create Y (IV) axis with ticks
   const ivAxisStart = new THREE.Vector3(minStrike, 0, minDays);
-  const ivAxisEnd = new THREE.Vector3(minStrike, maxIV * 150, minDays); // Scale IV for visibility
+  const ivAxisEnd = new THREE.Vector3(minStrike, state.desiredVolHeight, minDays);
   
   // Generate tick marks for IV axis
   const ivTicks = [];
@@ -1520,7 +1574,7 @@ function createVolatilitySurface(data) {
   
   for (let tick = Math.ceil(minIV / ivStep) * ivStep; tick <= maxIV; tick += ivStep) {
     ivTicks.push({
-      value: tick * 100, // Scale for visibility
+      value: tick * (state.desiredVolHeight / maxIV),
       label: (tick * 100).toFixed(1) + '%'
     });
   }
@@ -1532,7 +1586,7 @@ function createVolatilitySurface(data) {
   
   ivLevels.forEach(ivLevel => {
     if (ivLevel >= minIV && ivLevel <= maxIV) {
-      const yPosition = ivLevel * 100;
+      const yPosition = ivLevel * (state.desiredVolHeight / maxIV);
       
       // Create a horizontal grid at this IV level
       const gridGeometry = new THREE.PlaneGeometry(
@@ -1582,9 +1636,10 @@ function createVolatilitySurface(data) {
   const gridData = Array(strikeGridSize).fill().map(() => Array(daysGridSize).fill(null));
   const gammaGridData = Array(strikeGridSize).fill().map(() => Array(daysGridSize).fill(null));
   
-  // Organize data by strike and days
+  // Organize data by strike and days using transformed strikes
   data.forEach(item => {
-    const strikeIndex = Math.min(strikeGridSize - 1, Math.max(0, Math.floor((item.strike - minStrike) / strikeGridStep)));
+    const transformedStrike = transformStrike(item.strike);
+    const strikeIndex = Math.min(strikeGridSize - 1, Math.max(0, Math.floor((transformedStrike - minStrike) / strikeGridStep)));
     const daysIndex = Math.min(daysGridSize - 1, Math.max(0, Math.floor((item.daysToExpiry - minDays) / daysGridStep)));
     
     if (!gridData[strikeIndex][daysIndex]) {
@@ -1630,6 +1685,9 @@ function createVolatilitySurface(data) {
     (minDays + maxDays) / 2
   );
   
+  // Calculate scaling factor for IV so that maxIV maps to state.desiredVolHeight
+  const volScale = state.desiredVolHeight / maxIV;
+  
   // Update vertices to match IV values
   const positions = geometry.attributes.position.array;
   const colors = [];
@@ -1650,8 +1708,8 @@ function createVolatilitySurface(data) {
         iv = gridData[strikeIndex][daysIndex].iv;
       }
       
-      // Update height (y coordinate) to match IV
-      const scaledIV = iv * 100; // Scale for better visibility
+      // Update height (y coordinate) to match normalized IV
+      const scaledIV = iv * volScale;
       positions[i * 3 + 1] = scaledIV;
       
       // Add color based on IV
@@ -1703,8 +1761,8 @@ function createVolatilitySurface(data) {
   const pointColors = [];
   
   data.forEach(item => {
-    const x = item.strike;
-    const y = item.iv * 100; // Scale for visibility
+    const x = transformStrike(item.strike);
+    const y = item.iv * volScale; // Use normalized scaling
     const z = item.daysToExpiry;
     
     pointPositions.push(x, y, z);
@@ -1740,13 +1798,13 @@ function createVolatilitySurface(data) {
   if (state.showLabels) {
     // Title label with ticker symbol
     const titleLabel = createTextLabel(`${state.currentSymbol} IV Surface`, 
-        new THREE.Vector3((minStrike + maxStrike) / 2, maxIV * 120, maxDays + 20));
+        new THREE.Vector3((minStrike + maxStrike) / 2, state.desiredVolHeight + 20, maxDays + 20));
     labelGroup.add(titleLabel);
     
     // Add key metrics
     const metricsLabel = createTextLabel(
       `Min IV: ${(minIV * 100).toFixed(1)}%\nMax IV: ${(maxIV * 100).toFixed(1)}%\nStrikes: ${minStrike.toFixed(0)}-${maxStrike.toFixed(0)}`,
-      new THREE.Vector3(minStrike, maxIV * 120, minDays)
+      new THREE.Vector3(minStrike, state.desiredVolHeight + 20, minDays)
     );
     labelGroup.add(metricsLabel);
     
@@ -1772,13 +1830,13 @@ function createVolatilitySurface(data) {
       
       for (let j = 0; j < contracts.length; j += strikeStride) {
         const contract = contracts[j];
-        const strike = contract.strike;
+        const strike = transformStrike(contract.strike);
         const iv = contract.iv;
         
         // Create short label with strike price and IV
         const contractLabel = createTextLabel(
           `${strike.toFixed(1)}\n${(iv * 100).toFixed(1)}%`,
-          new THREE.Vector3(strike, iv * 100 + 10, daysToExpiry),
+          new THREE.Vector3(strike, iv * volScale + 10, daysToExpiry),
           0xFFFFFF,
           0.5,
           true // compact
@@ -1808,8 +1866,8 @@ function createVolatilitySurface(data) {
       // Create vertical line
       const lineGeometry = new THREE.BufferGeometry().setFromPoints([
         new THREE.Vector3(strike, 0, minDays),
-        new THREE.Vector3(strike, maxIV * 100, minDays),
-        new THREE.Vector3(strike, maxIV * 100, maxDays),
+        new THREE.Vector3(strike, state.desiredVolHeight, minDays),
+        new THREE.Vector3(strike, state.desiredVolHeight, maxDays),
         new THREE.Vector3(strike, 0, maxDays)
       ]);
       
@@ -1825,7 +1883,7 @@ function createVolatilitySurface(data) {
   }
   
   // Position camera to view the surface optimally
-  positionCameraForOptimalView(minStrike, maxStrike, minDays, maxDays, maxIV);
+  positionCameraForOptimalView(minStrike, maxStrike, minDays, maxDays, state.desiredVolHeight);
   
   updateStatus(`Volatility surface for ${state.currentSymbol} created successfully.`);
 }
@@ -1919,7 +1977,7 @@ function createGammaVisualization(data, gammaGridData, minGamma, maxGamma, minSt
     data.forEach(item => {
       if (item.gamma === undefined) return;
       
-      const x = item.strike;
+      const x = transformStrike(item.strike);
       const y = -5; // Position below the surface
       const z = item.daysToExpiry;
       
@@ -1962,7 +2020,7 @@ function createGammaVisualization(data, gammaGridData, minGamma, maxGamma, minSt
     data.forEach(item => {
       if (item.gamma === undefined) return;
       
-      const x = item.strike;
+      const x = transformStrike(item.strike);
       const z = item.daysToExpiry;
       const gammaHeight = (item.gamma / maxGamma) * 50; // Scale gamma for visibility
       
@@ -2000,9 +2058,9 @@ function createGammaVisualization(data, gammaGridData, minGamma, maxGamma, minSt
 }
 
 // Position camera for optimal view of the surface
-function positionCameraForOptimalView(minStrike, maxStrike, minDays, maxDays, maxIV) {
+function positionCameraForOptimalView(minStrike, maxStrike, minDays, maxDays, maxIVHeight) {
   const centerX = (minStrike + maxStrike) / 2;
-  const centerY = (maxIV * 100) / 2;
+  const centerY = maxIVHeight / 2;
   const centerZ = (minDays + maxDays) / 2;
   
   // Position camera at an angle
